@@ -4,34 +4,34 @@ from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 
 @tool
-def get_rendered_html(url: str) -> dict:
+def get_rendered_html(target_url: str) -> dict:
     """
     Fetch and return the fully rendered HTML of a webpage.
     """
-    print("\nFetching and rendering:", url)
+    print("\nFetching and rendering:", target_url)
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page()
+        with sync_playwright() as playwright_instance:
+            browser_instance = playwright_instance.chromium.launch(headless=True)
+            page_instance = browser_instance.new_page()
 
-            page.goto(url, wait_until="networkidle")
-            content = page.content()
+            page_instance.goto(target_url, wait_until="networkidle")
+            html_content = page_instance.content()
 
-            browser.close()
+            browser_instance.close()
 
             # Parse images
-            soup = BeautifulSoup(content, "html.parser")
-            imgs = [urljoin(url, img["src"]) for img in soup.find_all("img", src=True)]
-            if len(content) > 300000:
+            html_parser = BeautifulSoup(html_content, "html.parser")
+            image_urls = [urljoin(target_url, img["src"]) for img in html_parser.find_all("img", src=True)]
+            if len(html_content) > 300000:
                     print("Warning: HTML too large, truncating...")
-                    content = content[:300000] + "... [TRUNCATED DUE TO SIZE]"
+                    html_content = html_content[:300000] + "... [TRUNCATED DUE TO SIZE]"
             return {
-                "html": content,
-                "images": imgs,
-                "url": url
+                "html": html_content,
+                "images": image_urls,
+                "url": target_url
             }
 
-    except Exception as e:
-        return {"error": f"Error fetching/rendering page: {str(e)}"}
+    except Exception as error:
+        return {"error": f"Error fetching/rendering page: {str(error)}"}
 
 

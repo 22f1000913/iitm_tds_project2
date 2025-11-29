@@ -5,20 +5,20 @@ from dotenv import load_dotenv
 import os
 from google.genai import types
 load_dotenv()
-client = genai.Client()
+google_client = genai.Client()
 
-def strip_code_fences(code: str) -> str:
-    code = code.strip()
+def clean_code_formatting(source_code: str) -> str:
+    source_code = source_code.strip()
     # Remove ```python ... ``` or ``` ... ```
-    if code.startswith("```"):
+    if source_code.startswith("```"):
         # remove first line (```python or ```)
-        code = code.split("\n", 1)[1]
-    if code.endswith("```"):
-        code = code.rsplit("\n", 1)[0]
-    return code.strip()
+        source_code = source_code.split("\n", 1)[1]
+    if source_code.endswith("```"):
+        source_code = source_code.rsplit("\n", 1)[0]
+    return source_code.strip()
 
 @tool
-def run_code(code: str) -> dict:
+def run_code(source_code: str) -> dict:
     """
     Executes a Python code 
     This tool:
@@ -29,7 +29,7 @@ def run_code(code: str) -> dict:
 
     Parameters
     ----------
-    code : str
+    source_code : str
         Python source code to execute.
 
     Returns
@@ -42,32 +42,32 @@ def run_code(code: str) -> dict:
         }
     """
     try: 
-        filename = "runner.py"
+        script_filename = "runner.py"
         os.makedirs("LLMFiles", exist_ok=True)
-        with open(os.path.join("LLMFiles", filename), "w") as f:
-            f.write(code)
+        with open(os.path.join("LLMFiles", script_filename), "w") as script_file:
+            script_file.write(source_code)
 
-        proc = subprocess.Popen(
-            ["uv", "run", filename],
+        execution_process = subprocess.Popen(
+            ["uv", "run", script_filename],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             cwd="LLMFiles"
         )
-        stdout, stderr = proc.communicate()
-        if len(stdout) >= 10000:
-            return stdout[:10000] + "...truncated due to large size"
-        if len(stderr) >= 10000:
-            return stderr[:10000] + "...truncated due to large size"
+        std_output, std_error = execution_process.communicate()
+        if len(std_output) >= 10000:
+            return std_output[:10000] + "...truncated due to large size"
+        if len(std_error) >= 10000:
+            return std_error[:10000] + "...truncated due to large size"
         # --- Step 4: Return everything ---
         return {
-            "stdout": stdout,
-            "stderr": stderr,
-            "return_code": proc.returncode
+            "stdout": std_output,
+            "stderr": std_error,
+            "return_code": execution_process.returncode
         }
-    except Exception as e:
+    except Exception as execution_error:
         return {
             "stdout": "",
-            "stderr": str(e),
+            "stderr": str(execution_error),
             "return_code": -1
         }

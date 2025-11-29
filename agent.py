@@ -1,60 +1,63 @@
-from langgraph.graph import StateGraph, END, START
-from shared_store import url_time
+import os
 import time
-from langchain_core.rate_limiters import InMemoryRateLimiter
+from typing import TypedDict, Annotated, List
+from dotenv import load_dotenv
+
+from langgraph.graph import StateGraph, END, START
 from langgraph.prebuilt import ToolNode
+from langgraph.graph.message import add_messages
+from langchain_core.rate_limiters import InMemoryRateLimiter
+from langchain_core.messages import trim_messages, HumanMessage
+from langchain.chat_models import init_chat_model
+
+from shared_store import url_time
 from tools import (
     get_rendered_html, download_file, post_request,
     run_code, add_dependencies, ocr_image_tool, transcribe_audio, encode_image_to_base64
 )
-from typing import TypedDict, Annotated, List
-from langchain_core.messages import trim_messages, HumanMessage
-from langchain.chat_models import init_chat_model
-from langgraph.graph.message import add_messages
-import os
-from dotenv import load_dotenv
+
 load_dotenv()
 
-EMAIL = os.getenv("EMAIL")
-SECRET = os.getenv("SECRET")
+USER_EMAIL = os.getenv("EMAIL")
+USER_SECRET = os.getenv("SECRET")
 
-RECURSION_LIMIT = 5000
-MAX_TOKENS = 60000
+MAX_RECURSION_DEPTH = 5000
+TOKEN_LIMIT = 60000
 
 
 # -------------------------------------------------
-# STATE
+# STATE DEFINITION
 # -------------------------------------------------
-class AgentState(TypedDict):
+class QuizAgentState(TypedDict):
     messages: Annotated[List, add_messages]
 
 
-TOOLS = [
+AVAILABLE_TOOLS = [
     run_code, get_rendered_html, download_file,
     post_request, add_dependencies, ocr_image_tool, transcribe_audio, encode_image_to_base64
 ]
 
 
 # -------------------------------------------------
-# LLM INIT
+# LANGUAGE MODEL INITIALIZATION
 # -------------------------------------------------
-rate_limiter = InMemoryRateLimiter(
+api_rate_limiter = InMemoryRateLimiter(
     requests_per_second=4 / 60,
     check_every_n_seconds=1,
     max_bucket_size=4
 )
 
-llm = init_chat_model(
+language_model = init_chat_model(
     model_provider="google_genai",
     model="gemini-2.5-flash",
-    rate_limiter=rate_limiter
-).bind_tools(TOOLS)
+    rate_limiter=api_rate_limiter
+).bind_tools(AVAILABLE_TOOLS)
 
 
 # -------------------------------------------------
 # SYSTEM PROMPT
 # -------------------------------------------------
-SYSTEM_PROMPT = f"""
+QUIZ_SYSTEM_PROMPT = f"""
 You are an autonomous quiz-solving agent.
 
 Your job is to:
@@ -72,15 +75,15 @@ Rules:
 - Never stop early.
 - Use tools for HTML, downloading, rendering, OCR, or running code.
 - Include:
-    email = {EMAIL}
-    secret = {SECRET}
+    email = {USER_EMAIL}
+    secret = {USER_SECRET}
 """
 
 
 # -------------------------------------------------
 # NEW NODE: HANDLE MALFORMED JSON
 # -------------------------------------------------
-def handle_malformed_node(state: AgentState):
+def handle_json_error_node(state: QuizAgentState):
     """
     If the LLM generates invalid JSON, this node sends a correction message
     so the LLM can try again.
@@ -99,88 +102,88 @@ def handle_malformed_node(state: AgentState):
 # -------------------------------------------------
 # AGENT NODE
 # -------------------------------------------------
-def agent_node(state: AgentState):
+def quiz_processing_node(state: QuizAgentState):
     # --- TIME HANDLING START ---
-    cur_time = time.time()
-    cur_url = os.getenv("url")
+    current_time = time.time()
+    current_url = os.getenv("url")
     
     # SAFE GET: Prevents crash if url is None or not in dict
-    prev_time = url_time.get(cur_url) 
-    offset = os.getenv("offset", "0")
+    previous_time = url_time.get(current_url) 
+    time_offset = os.getenv("offset", "0")
 
-    if prev_time is not None:
-        prev_time = float(prev_time)
-        diff = cur_time - prev_time
+    if previous_time is not None:
+        previous_time = float(previous_time)
+        time_difference = current_time - previous_time
 
-        if diff >= 180 or (offset != "0" and (cur_time - float(offset)) > 90):
-            print(f"Timeout exceeded ({diff}s) — instructing LLM to purposely submit wrong answer.")
+        if time_difference >= 180 or (time_offset != "0" and (current_time - float(time_offset)) > 90):
+            print(f"Timeout exceeded ({time_difference}s) — instructing LLM to purposely submit wrong answer.")
 
-            fail_instruction = """
+            timeout_instruction = """
             You have exceeded the time limit for this task (over 180 seconds).
             Immediately call the `post_request` tool and submit a WRONG answer for the CURRENT quiz.
             """
 
             # Using HumanMessage (as you correctly implemented)
-            fail_msg = HumanMessage(content=fail_instruction)
+            timeout_message = HumanMessage(content=timeout_instruction)
 
             # We invoke the LLM immediately with this new instruction
-            result = llm.invoke(state["messages"] + [fail_msg])
+            result = language_model.invoke(state["messages"] + [timeout_message])
             return {"messages": [result]}
     # --- TIME HANDLING END ---
 
-    trimmed_messages = trim_messages(
+    trimmed_context = trim_messages(
         messages=state["messages"],
-        max_tokens=MAX_TOKENS,
+        max_tokens=TOKEN_LIMIT,
         strategy="last",
         include_system=True,
         start_on="human",
-        token_counter=llm, 
+        token_counter=language_model, 
     )
     
     # Better check: Does it have a HumanMessage?
-    has_human = any(msg.type == "human" for msg in trimmed_messages)
+    has_human_message = any(msg.type == "human" for msg in trimmed_context)
     
-    if not has_human:
+    if not has_human_message:
         print("WARNING: Context was trimmed too far. Injecting state reminder.")
         # We remind the agent of the current URL from the environment
-        current_url = os.getenv("url", "Unknown URL")
-        reminder = HumanMessage(content=f"Context cleared due to length. Continue processing URL: {current_url}")
+        current_quiz_url = os.getenv("url", "Unknown URL")
+        context_reminder = HumanMessage(content=f"Context cleared due to length. Continue processing URL: {current_quiz_url}")
         
         # We append this to the trimmed list (temporarily for this invoke)
-        trimmed_messages.append(reminder)
+        trimmed_context.append(context_reminder)
     # ----------------------------------------
 
-    print(f"--- INVOKING AGENT (Context: {len(trimmed_messages)} items) ---")
+    print(f"--- INVOKING AGENT (Context: {len(trimmed_context)} items) ---")
     
-    result = llm.invoke(trimmed_messages)
+    result = language_model.invoke(trimmed_context)
 
     return {"messages": [result]}
 
 
 # -------------------------------------------------
-# ROUTE LOGIC (UPDATED FOR MALFORMED CALLS)
+# ROUTING LOGIC (UPDATED FOR MALFORMED CALLS)
 # -------------------------------------------------
-def route(state):
-    last = state["messages"][-1]
+def determine_next_step(state):
+    last_message = state["messages"][-1]
     
     # 1. CHECK FOR MALFORMED FUNCTION CALLS
-    if "finish_reason" in last.response_metadata:
-        if last.response_metadata["finish_reason"] == "MALFORMED_FUNCTION_CALL":
+    if "finish_reason" in last_message.response_metadata:
+        if last_message.response_metadata["finish_reason"] == "MALFORMED_FUNCTION_CALL":
             return "handle_malformed"
 
     # 2. CHECK FOR VALID TOOLS
-    tool_calls = getattr(last, "tool_calls", None)
-    if tool_calls:
+    available_tool_calls = getattr(last_message, "tool_calls", None)
+    if available_tool_calls:
         print("Route → tools")
         return "tools"
 
     # 3. CHECK FOR END
-    content = getattr(last, "content", None)
-    if isinstance(content, str) and content.strip() == "END":
+    message_content = getattr(last_message, "content", None)
+    if isinstance(message_content, str) and message_content.strip() == "END":
         return END
 
-    if isinstance(content, list) and len(content) and isinstance(content[0], dict):
-        if content[0].get("text", "").strip() == "END":
+    if isinstance(message_content, list) and len(message_content) and isinstance(message_content[0], dict):
+        if message_content[0].get("text", "").strip() == "END":
             return END
 
     print("Route → agent")
@@ -188,24 +191,24 @@ def route(state):
 
 
 # -------------------------------------------------
-# GRAPH
+# WORKFLOW GRAPH
 # -------------------------------------------------
-graph = StateGraph(AgentState)
+workflow_graph = StateGraph(QuizAgentState)
 
 # Add Nodes
-graph.add_node("agent", agent_node)
-graph.add_node("tools", ToolNode(TOOLS))
-graph.add_node("handle_malformed", handle_malformed_node) # Add the repair node
+workflow_graph.add_node("agent", quiz_processing_node)
+workflow_graph.add_node("tools", ToolNode(AVAILABLE_TOOLS))
+workflow_graph.add_node("handle_malformed", handle_json_error_node) # Add the repair node
 
 # Add Edges
-graph.add_edge(START, "agent")
-graph.add_edge("tools", "agent")
-graph.add_edge("handle_malformed", "agent") # Retry loop
+workflow_graph.add_edge(START, "agent")
+workflow_graph.add_edge("tools", "agent")
+workflow_graph.add_edge("handle_malformed", "agent") # Retry loop
 
 # Conditional Edges
-graph.add_conditional_edges(
+workflow_graph.add_conditional_edges(
     "agent", 
-    route,
+    determine_next_step,
     {
         "tools": "tools",
         "agent": "agent",
@@ -214,22 +217,22 @@ graph.add_conditional_edges(
     }
 )
 
-app = graph.compile()
+compiled_app = workflow_graph.compile()
 
 
 # -------------------------------------------------
-# RUNNER
+# EXECUTION RUNNER
 # -------------------------------------------------
-def run_agent(url: str):
+def run_agent(quiz_url: str):
     # system message is seeded ONCE here
-    initial_messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": url}
+    initial_message_stack = [
+        {"role": "system", "content": QUIZ_SYSTEM_PROMPT},
+        {"role": "user", "content": quiz_url}
     ]
 
-    app.invoke(
-        {"messages": initial_messages},
-        config={"recursion_limit": RECURSION_LIMIT}
+    compiled_app.invoke(
+        {"messages": initial_message_stack},
+        config={"recursion_limit": MAX_RECURSION_DEPTH}
     )
 
     print("Tasks completed successfully!")
